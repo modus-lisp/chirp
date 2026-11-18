@@ -10,3 +10,8 @@
                              (:file "packet")
                              (:file "identity")
                              (:file "mesh")))))
+
+;; the chat on the phone: native screens over kiln-native (vessel's ios-native.lisp, loaded by the world first)
+(defsystem "chirp/app"
+  :depends-on ("chirp")
+  :components ((:module "src" :components ((:file "app")))))
