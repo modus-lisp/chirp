@@ -15,3 +15,8 @@
 (defsystem "chirp/app"
   :depends-on ("chirp")
   :components ((:module "src" :components ((:file "app")))))
+
+;; the chat in a glass window, for a desktop (modus on Windows: its radio is net/win32-ble.lisp)
+(defsystem "chirp/glass"
+  :depends-on ("chirp" "glass" "glass/text")
+  :components ((:module "src" :components ((:file "glass")))))
