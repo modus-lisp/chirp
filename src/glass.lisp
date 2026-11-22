@@ -247,7 +247,7 @@
       (values
        ;; ON-KEY
        (lambda (down ks)
-         (when (eql down 1)
+         (when down
            (cond ((= ks #xff0d) (say))                                   ; Return
                  ((= ks #xff08) (when (plusp (length line))              ; BackSpace
                                   (setf line (subseq line 0 (1- (length line))) dirty t)))
