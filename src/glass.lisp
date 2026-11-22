@@ -18,8 +18,12 @@
 ;;;; here (app.lisp's rule for a machine without one).  The radio's log, frames and all, goes to
 ;;;; ~/.chirp/chirp.log, to send back from a test.
 ;;;;
-;;;; Keys: type and Return to send; Tab shows the radio's log instead of the chat (and back);
-;;;; Escape clears the line.
+;;;; THE CLOCK is local: modus has no zone database, so the host's W32-UTC-OFFSET (modus
+;;;; net/win32-time.lisp, seconds east of UTC) is asked by name, once a minute; with none, UTC.
+;;;;
+;;;; Keys: type and Return to send; Tab steps through the chat, who is nearby and the radio's
+;;;; log; Escape clears the line and goes back to the chat.  `/nick NAME' is the nickname
+;;;; (saved, and announced at once); `/nick' alone says what it is.
 
 (defpackage #:chirp-glass
   (:use #:cl #:chirp)
@@ -74,10 +78,22 @@
       (push row rows)
       (nreverse rows))))
 
-(defun %clock (ms)
-  (multiple-value-bind (s m h) (decode-universal-time (+ (floor ms 1000) 2208988800))
-    (declare (ignore s))
-    (format nil "~2,'0D:~2,'0D" h m)))
+(defun %utc-offset ()
+  "Seconds east of UTC here, from the host (modus on Windows: W32-UTC-OFFSET), else 0."
+  (let ((f (%radio-fn "W32-UTC-OFFSET")))
+    (or (and f (let ((v (ignore-errors (funcall f)))) (and (integerp v) v))) 0)))
+
+(defun %clock (ms offset)
+  (let ((day (mod (+ (floor ms 1000) offset) 86400)))
+    (format nil "~2,'0D:~2,'0D" (floor day 3600) (floor (mod day 3600) 60))))
+
+(defun %ago (ms)
+  (let ((s (max 0 (floor ms 1000))))
+    (cond ((< s 60) (format nil "~Ds ago" s))
+          ((< s 3600) (format nil "~Dm ago" (floor s 60)))
+          (t (format nil "~Dh ago" (floor s 3600))))))
+
+(defparameter +nick-max+ 32 "The longest nickname /nick takes.")
 
 (defun %keysym-char (ks)
   (cond ((<= #x20 ks #x7e) (code-char ks))
@@ -99,7 +115,8 @@
          (radio nil) (radio-on nil) (why nil)
          (links (make-hash-table)) (partial (make-hash-table))
          (rows '()) (known (make-hash-table :test 'equal)) (log '())
-         (line "") (show-log nil) (dirty t) (last-tick 0)
+         (line "") (view :chat) (dirty t) (last-tick 0)
+         (offset (%utc-offset)) (offset-at (get-internal-real-time))
          (log-path (%home-file "chirp.log"))
          (mesh nil))
     (labels ((note (fmt &rest args)
@@ -110,7 +127,7 @@
                   (ensure-directories-exist log-path)
                   (with-open-file (out log-path :direction :output :if-exists :append :if-does-not-exist :create)
                     (format out "~D ~A~%" (chirp::unix-ms) text)))
-                 (when show-log (setf dirty t))))
+                 (when (eq view :log) (setf dirty t))))
              (row (r) (setf rows (append rows (list r)) dirty t)
                (when (> (length rows) 500) (setf rows (subseq rows 100))))
              (send-frame (frame &key link except)
@@ -173,11 +190,31 @@
                                        (take-events (mesh-link-down mesh link))))
                             (setf dirty t)))
                    (:data (destructuring-bind (link bytes) args (take-frame link bytes))))))
+             (nick (name)
+               (let ((id (mesh-identity mesh)))
+                 (cond ((zerop (length name))
+                        (row (list :note (format nil "You are ~A.  /nick NAME to change it."
+                                                 (identity-nickname id))
+                                   (chirp::unix-ms))))
+                       ((> (length name) +nick-max+)
+                        (row (list :note (format nil "A nickname is at most ~D characters." +nick-max+)
+                                   (chirp::unix-ms))))
+                       (t (setf (identity-nickname id) name)
+                          (handler-case (%save-identity id)
+                            (error (c) (note "nickname not saved: ~A" c)))
+                          (note "nickname ~A" name)
+                          (mesh-announce mesh)
+                          (row (list :note (format nil "You are now ~A." name) (chirp::unix-ms)))))))
              (say ()
                (let ((text (string-trim " " line)))
-                 (setf line "" dirty t)
-                 (when (plusp (length text))
-                   (row (list :chat (mesh-say mesh text))))))
+                 (setf line "" dirty t view :chat)
+                 (cond ((zerop (length text)))
+                       ((or (string= text "/nick") (and (> (length text) 6) (string= (subseq text 0 6) "/nick ")))
+                        (nick (string-trim " " (subseq text 5))))
+                       ((char= (char text 0) #\/)
+                        (row (list :note (format nil "~A: not a command here.  /nick NAME is." text)
+                                   (chirp::unix-ms))))
+                       (t (row (list :chat (mesh-say mesh text)))))))
              (draw ()
                (let* ((w (glass:fb-width fb)) (h (glass:fb-height fb))
                       (size 15) (lh 20) (margin 12) (bar 30) (input 34)
@@ -185,7 +222,8 @@
                  (glass:fb-fill fb +paper+)
                  ;; the title bar: the channel, who is near, the radio
                  (glass:fb-rect fb 0 0 w bar +bar+)
-                 (glass:fb-text fb margin 7 (format nil "#mesh  ·  ~D nearby  ·  ~D link~:P"
+                 (glass:fb-text fb margin 7 (format nil "#mesh  ·  ~A  ·  ~D nearby  ·  ~D link~:P"
+                                                    (identity-nickname (mesh-identity mesh))
                                                     (hash-table-count (mesh-peers mesh))
                                                     (hash-table-count links) (hash-table-count links))
                                 :size 14 :color +ink+)
@@ -195,18 +233,39 @@
                                   :color (if radio-on #x3fb950 +dim+)))
                  ;; the rows, newest at the bottom, as many as fit
                  (let ((y bottom) (inner (- w (* 2 margin))))
-                   (if show-log
+                   (case view
+                     (:log
                        (dolist (l log)
                          (when (< y (+ bar lh)) (return))
                          (dolist (r (reverse (%wrap l inner 12)))
                            (decf y 16)
                            (when (< y bar) (return))
-                           (glass:fb-text fb margin y r :size 12 :color +dim+)))
+                           (glass:fb-text fb margin y r :size 12 :color +dim+))))
+                     (:nearby
+                      ;; who the mesh knows, top down: a name, then its id, how it is reached, when last heard
+                      (let ((peers (sort (loop for p being the hash-values of (mesh-peers mesh) collect p)
+                                         #'string-lessp :key #'peer-nickname))
+                            (now (chirp::unix-ms)) (top (+ bar 12)))
+                        (if (null peers)
+                            (progn
+                              (glass:fb-text fb margin top "No one nearby." :size size :color +dim+)
+                              (glass:fb-text fb margin (+ top lh) "Phones with bitchat in Bluetooth range show here."
+                                             :size 13 :color +dim+))
+                            (dolist (p peers)
+                              (when (> (+ top lh 18) bottom) (return))
+                              (glass:fb-text fb margin top (peer-nickname p) :size size :color +them+)
+                              (glass:fb-text fb margin (+ top lh)
+                                             (format nil "~A  ·  ~:[through the mesh~;in range~]  ·  ~A"
+                                                     (peer-id p) (peer-links p) (%ago (- now (peer-seen p))))
+                                             :size 12 :color +dim+)
+                              (incf top (+ lh 24))))))
+                     (t
                        (dolist (r (reverse rows))
                          (when (< y (+ bar lh)) (return))
                          (ecase (first r)
                            (:chat (let* ((c (second r))
-                                         (head (format nil "~A  ~A" (chat-nickname c) (%clock (chat-timestamp c))))
+                                         (head (format nil "~A  ~A" (chat-nickname c)
+                                                       (%clock (chat-timestamp c) offset)))
                                          (body (%wrap (chat-text c) inner size)))
                                     (dolist (b (reverse body))
                                       (decf y lh)
@@ -219,17 +278,20 @@
                                     (decf y 6)))
                            (:note (decf y lh)
                             (when (>= y bar)
-                              (glass:fb-text fb margin y (format nil "~A  ~A" (second r) (%clock (third r)))
+                              (glass:fb-text fb margin y (format nil "~A  ~A" (second r) (%clock (third r) offset))
                                              :size 13 :color +dim+))
-                            (decf y 6)))))
-                   (when (and (not show-log) (null rows))
+                            (decf y 6))))))
+                   (when (and (eq view :chat) (null rows))
                      (glass:fb-text fb margin (+ bar 16) "Nobody has said anything yet." :size size :color +dim+)
                      (glass:fb-text fb margin (+ bar 16 lh) "Phones with bitchat in Bluetooth range show here."
                                     :size 13 :color +dim+)))
                  ;; the line being typed
                  (glass:fb-rect fb 0 bottom w input +bar+)
                  (let ((shown (if (plusp (length line)) line
-                                  (if show-log "Radio log  ·  Tab for the chat" "Message  ·  Tab for the radio log"))))
+                                  (ecase view
+                                    (:chat "Message  ·  /nick NAME  ·  Tab: who is nearby")
+                                    (:nearby "Nearby  ·  Tab: the radio log  ·  Esc: the chat")
+                                    (:log "Radio log  ·  Tab: the chat")))))
                    (let ((x (glass:fb-text fb margin (+ bottom 8) shown :size size
                                            :color (if (plusp (length line)) +ink+ +dim+))))
                      (when (plusp (length line))
@@ -251,8 +313,9 @@
            (cond ((= ks #xff0d) (say))                                   ; Return
                  ((= ks #xff08) (when (plusp (length line))              ; BackSpace
                                   (setf line (subseq line 0 (1- (length line))) dirty t)))
-                 ((= ks #xff09) (setf show-log (not show-log) dirty t))  ; Tab
-                 ((= ks #xff1b) (setf line "" dirty t))                  ; Escape
+                 ((= ks #xff09) (setf view (ecase view (:chat :nearby) (:nearby :log) (:log :chat))
+                                      dirty t))                           ; Tab
+                 ((= ks #xff1b) (setf line "" view :chat dirty t))       ; Escape
                  (t (let ((ch (%keysym-char ks)))
                       (when (and ch (< (length line) 400))
                         (setf line (concatenate 'string line (string ch)) dirty t)))))))
@@ -265,7 +328,13 @@
          (let ((now (get-internal-real-time)))
            (when (> (- now last-tick) internal-time-units-per-second)
              (setf last-tick now)
-             (handler-case (mesh-tick mesh) (error (c) (note "tick error: ~A" c)))))
+             (handler-case (mesh-tick mesh) (error (c) (note "tick error: ~A" c)))
+             ;; the zone again once a minute (daylight time starts and ends); the Nearby
+             ;; view's "seen" times move every second
+             (when (> (- now offset-at) (* 60 internal-time-units-per-second))
+               (setf offset-at now)
+               (let ((o (%utc-offset))) (unless (= o offset) (setf offset o dirty t))))
+             (when (eq view :nearby) (setf dirty t))))
          (when dirty (draw)))
        nil
        ;; CLOSE: a leave to whoever is linked, then the radio off
